@@ -4,6 +4,7 @@ import time
 import logging
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
 
@@ -12,6 +13,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Semantic Search API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Load reviews
 REVIEWS = []
@@ -26,25 +35,35 @@ except FileNotFoundError:
 
 class SearchSystem:
     def __init__(self):
-        self.use_openai = bool(os.environ.get("OPENAI_API_KEY"))
+        # AI Pipe Configuration
+        self.aipipe_token = os.environ.get("AIPIPE_TOKEN")
+        self.openai_key = os.environ.get("OPENAI_API_KEY")
+        
+        self.api_key = self.aipipe_token or self.openai_key
+        self.base_url = os.environ.get("AIPIPE_BASE_URL", "https://api.openai.com/v1") if self.aipipe_token else None
+        
+        self.embedding_model = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+        self.rerank_model = os.environ.get("RERANK_MODEL", "gpt-3.5-turbo")
+
         self.vectorizer = None
         self.tfidf_matrix = None
         self.openai_client = None
         
-        # Simple cache for document embeddings to avoid recomputing on startup if using API
-        # In a real app, use a vector DB or persistent cache
         self.doc_embeddings = {} 
 
-        if self.use_openai:
+        if self.api_key:
             try:
                 from openai import OpenAI
-                self.openai_client = OpenAI()
-                logger.info("Using OpenAI for embeddings.")
+                self.openai_client = OpenAI(
+                    api_key=self.api_key,
+                    base_url=self.base_url
+                )
+                logger.info(f"Using OpenAI compatible client (Base URL: {self.base_url}).")
             except ImportError:
                 logger.warning("openai module not found, falling back to TF-IDF")
-                self.use_openai = False
+                self.api_key = None
         
-        if not self.use_openai:
+        if not self.api_key:
             logger.info("Using TF-IDF for embeddings (Fallback).")
             try:
                 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -55,35 +74,29 @@ class SearchSystem:
                 logger.error("scikit-learn not found! Search will fail.")
 
     def get_embedding(self, text: str):
-        if self.use_openai and self.openai_client:
+        if self.openai_client:
             try:
                 response = self.openai_client.embeddings.create(
                     input=text,
-                    model="text-embedding-3-small"
+                    model=self.embedding_model
                 )
                 return response.data[0].embedding
             except Exception as e:
-                logger.error(f"OpenAI Embedding Error: {e}")
+                logger.error(f"Embedding Error: {e}")
                 return []
         return None
 
     def search(self, query: str, k: int = 10):
         results = []
-        if self.use_openai:
+        if self.openai_client:
             query_vec = self.get_embedding(query)
             if not query_vec:
                 return []
             
-            # Compute cosine similarity manually for this small dataset
-            # (In production, use FAISS/Chroma)
             query_vec = np.array(query_vec)
             norm_q = np.linalg.norm(query_vec)
             
             for doc in REVIEWS:
-                # Naively recompute doc embedding if not cached (very slow for real usage)
-                # Ideally, we cache these. For assignment 59 docs, we can try caching or just compute.
-                # BUT computing 59 embeddings per request is too slow (>200ms).
-                # So we MUST cache or pre-compute.
                 if doc['id'] not in self.doc_embeddings:
                      self.doc_embeddings[doc['id']] = self.get_embedding(doc['content'])
                 
@@ -103,12 +116,10 @@ class SearchSystem:
                 })
         
         elif self.vectorizer:
-            # TF-IDF Search
             from sklearn.metrics.pairwise import cosine_similarity
             query_vec = self.vectorizer.transform([query])
             cosine_sim = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
             
-            # Get top k indices
             top_k_indices = cosine_sim.argsort()[::-1][:k]
             for idx in top_k_indices:
                 results.append({
@@ -118,19 +129,17 @@ class SearchSystem:
                     "metadata": {"source": REVIEWS[idx].get('source')}
                 })
         
-        # Sort and return top k
         results.sort(key=lambda x: x['score'], reverse=True)
         return results[:k]
 
     def rerank(self, query: str, candidates: List[Dict], k: int = 6):
-        if self.use_openai and self.openai_client:
+        if self.openai_client:
             reranked = []
             for doc in candidates:
                 try:
-                    # Simple re-ranking logic using LLM
                     prompt = f"Query: {query}\nDocument: {doc['content']}\n\nRate relevance 0-10. Return number only."
                     response = self.openai_client.chat.completions.create(
-                        model="gpt-3.5-turbo", # or gpt-4o-mini
+                        model=self.rerank_model,
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0,
                         max_tokens=5
@@ -139,7 +148,7 @@ class SearchSystem:
                     try:
                         new_score = float(score_str) / 10.0
                     except ValueError:
-                        new_score = doc['score'] # Keep original if parse fails
+                        new_score = doc['score']
                     
                     doc['score'] = new_score
                     reranked.append(doc)
